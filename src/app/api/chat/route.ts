@@ -21,24 +21,63 @@ export async function POST(req: Request) {
       // Handle object detection for the first image
       const base64Image = data.images[0];
 
-      // Upload to S3
-      const { url: s3Url } = await uploadBase64ImageToS3({ base64Image });
+      // Upload to S3 (best-effort). If it fails, fall back to direct upload to YOLO.
+      let s3Url: string | null = null;
+      try {
+        const uploaded = await uploadBase64ImageToS3({ base64Image });
+        s3Url = uploaded.url;
+      } catch (s3Err) {
+        console.error('S3 upload error:', s3Err);
+      }
 
-      // Also send to prediction API (expects a file upload)
-      // Convert data URL to blob for upload
-      const response = await fetch(base64Image);
-      const blob = await response.blob();
-      
-      // Create FormData for the prediction API
-      const formData = new FormData();
-      formData.append('file', blob, 'image.jpg');
-      
-      // Call the object detection API
-      const yoloBase = process.env.YOLO_SERVICE || 'localhost:8080';
-      const predictionResponse = await fetch(`http://${yoloBase}/predict`, {
-        method: 'POST',
-        body: formData,
-      });
+      const yoloBaseEnv = process.env.YOLO_SERVICE || 'localhost:8080';
+      const candidates = [
+        `http://${yoloBaseEnv}`,
+        // If the base is localhost, also try 127.0.0.1
+        yoloBaseEnv.startsWith('localhost:') ? `http://${yoloBaseEnv.replace('localhost', '127.0.0.1')}` : null,
+      ].filter(Boolean) as string[];
+
+      const fetchWithTimeout = async (url: string, init: RequestInit, ms = 8000) => {
+        const controller = new AbortController();
+        const id = setTimeout(() => controller.abort(), ms);
+        try {
+          return await fetch(url, { ...init, signal: controller.signal });
+        } finally {
+          clearTimeout(id);
+        }
+      };
+
+      let predictionResponse: Response | null = null;
+      let lastError: unknown = null;
+      for (const base of candidates) {
+        try {
+          if (s3Url) {
+            // Try POST with query param (as per example)
+            const tryPost = await fetchWithTimeout(`${base}/predict?img=${encodeURIComponent(s3Url)}`, { method: 'POST' });
+            if (tryPost.ok) { predictionResponse = tryPost; break; }
+            // Try GET variant if POST not supported
+            const tryGet = await fetchWithTimeout(`${base}/predict?img=${encodeURIComponent(s3Url)}`, { method: 'GET' });
+            if (tryGet.ok) { predictionResponse = tryGet; break; }
+            lastError = new Error(`YOLO responded with ${tryPost.status} (POST) and ${tryGet.status} (GET)`);
+          } else {
+            // Fallback: multipart upload
+            const response = await fetch(base64Image);
+            const blob = await response.blob();
+            const formData = new FormData();
+            formData.append('file', blob, 'image.jpg');
+            const tryMultipart = await fetchWithTimeout(`${base}/predict`, { method: 'POST', body: formData });
+            if (tryMultipart.ok) { predictionResponse = tryMultipart; break; }
+            lastError = new Error(`YOLO responded with ${tryMultipart.status} (multipart)`);
+          }
+        } catch (e) {
+          lastError = e;
+          continue;
+        }
+      }
+
+      if (!predictionResponse) {
+        throw lastError instanceof Error ? lastError : new Error('Failed to reach YOLO service');
+      }
       
       if (!predictionResponse.ok) {
         throw new Error(`Prediction API error: ${predictionResponse.status}`);
@@ -52,7 +91,7 @@ export async function POST(req: Request) {
 **Detection Count:** ${predictionResult.detection_count}
 **Detected Objects:** ${predictionResult.labels.join(', ')}
 **Prediction ID:** ${predictionResult.prediction_uid}
-**Image URL (S3):** ${s3Url}
+${s3Url ? `**Image URL (S3):** ${s3Url}` : '**Image URL (S3):** unavailable (upload failed)'}
 
 I've analyzed your image and detected ${predictionResult.detection_count} object(s). The detected objects include: ${predictionResult.labels.join(', ')}.`;
     

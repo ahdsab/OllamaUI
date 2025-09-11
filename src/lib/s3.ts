@@ -1,6 +1,6 @@
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { GetBucketLocationCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
-const s3Client = new S3Client({
+let s3Client = new S3Client({
   region: process.env.AWS_REGION,
   endpoint: process.env.AWS_S3_ENDPOINT || undefined,
   forcePathStyle: Boolean(process.env.AWS_S3_ENDPOINT),
@@ -37,6 +37,24 @@ export async function uploadBase64ImageToS3(params: {
   const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const key = `${keyPrefix}${unique}.${extension}`;
 
+  // Ensure we are using the correct bucket region to avoid endpoint mismatches
+  let resolvedRegion: string = process.env.AWS_REGION!;
+  try {
+    const loc = await s3Client.send(new GetBucketLocationCommand({ Bucket: bucket }));
+    // us-east-1 returns null/"" location constraint
+    const bucketRegion = !loc.LocationConstraint || loc.LocationConstraint === "" ? "us-east-1" : String(loc.LocationConstraint);
+    resolvedRegion = bucketRegion;
+    if (bucketRegion && bucketRegion !== process.env.AWS_REGION) {
+      s3Client = new S3Client({
+        region: bucketRegion,
+        endpoint: process.env.AWS_S3_ENDPOINT || undefined,
+        forcePathStyle: Boolean(process.env.AWS_S3_ENDPOINT),
+      });
+    }
+  } catch (e) {
+    // If we cannot get location, proceed with current client; upload may still succeed
+  }
+
   const command = new PutObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -45,14 +63,19 @@ export async function uploadBase64ImageToS3(params: {
     ACL: "public-read",
   });
 
-  await s3Client.send(command);
+  try {
+    await s3Client.send(command);
+  } catch (err) {
+    console.error("S3 upload failed:", err);
+    throw err;
+  }
 
   // Prefer explicitly configured public URL base if provided (useful for VPC endpoints or S3-compatible stores)
   const publicBase = process.env.AWS_S3_PUBLIC_URL
     ? process.env.AWS_S3_PUBLIC_URL.replace(/\/$/, "")
     : process.env.AWS_S3_ENDPOINT
     ? process.env.AWS_S3_ENDPOINT.replace(/\/$/, "")
-    : `https://${bucket}.s3.${process.env.AWS_REGION}.amazonaws.com`;
+    : `https://${bucket}.s3.${resolvedRegion}.amazonaws.com`;
 
   const url = `${publicBase}${publicBase.includes(bucket) ? "" : `/${bucket}`}/${key}`;
   return { key, url };
