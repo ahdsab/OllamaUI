@@ -65,10 +65,10 @@ export default function Chat({ initialMessages, id, isMobile }: ChatProps) {
     e.preventDefault();
     window.history.replaceState({}, "", `/c/${id}`);
 
-    if (!selectedModel) {
-      toast.error("Please select a model");
-      return;
-    }
+    // if (!selectedModel) {
+    //   toast.error("Please select a model");
+    //   return;
+    // }
 
     const userMessage: Message = {
       id: generateId(),
